@@ -98,6 +98,11 @@ def unique_filename(base_name, used_names):
         count += 1
     return name
 
+def safe_path_component(name):
+    name = re.sub(r'[\\/:*?"<>|]', '_', name)
+    name = name.strip(" .")
+    return name
+
 def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete_source=False):
     start_time = time.time()
     try:
@@ -109,7 +114,7 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
             total_files = len(all_files)
             image_files = [f for f in all_files if f.lower().endswith(IMAGE_EXTENSIONS)]
 
-            if total_files == 0:
+            if total_files == 0 or not image_files:
                 return "skipped", epub_path, 0, 0
 
             image_ratio = len(image_files) / total_files
@@ -131,6 +136,9 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
                             img_to_title[img_path] = page_title
                 except Exception:
                     pass
+
+            parent_dirs = set(os.path.basename(os.path.dirname(p)) or 'root' for p in image_files)
+            use_subdir = len(parent_dirs) > 1
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 used_names = set()
@@ -155,12 +163,25 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
                     name = unique_filename(base_name, used_names)
                     used_names.add(name)
 
-                    with epub_zip.open(image_file) as source, open(os.path.join(temp_dir, name), 'wb') as target:
+                    parent_base = os.path.basename(os.path.dirname(image_file))
+                    parent_dir_name = safe_path_component(parent_base) if parent_base else None
+
+                    if is_cover or not use_subdir or not parent_dir_name:
+                        target_subdir = temp_dir
+                    else:
+                        target_subdir = os.path.join(temp_dir, parent_dir_name)
+                    os.makedirs(target_subdir, exist_ok=True)
+
+                    target_path = os.path.join(target_subdir, name)
+                    with epub_zip.open(image_file) as source, open(target_path, 'wb') as target:
                         shutil.copyfileobj(source, target)
 
                 with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as out_zip:
-                    for file_name in os.listdir(temp_dir):
-                        out_zip.write(os.path.join(temp_dir, file_name), arcname=file_name)
+                    for root, _, files in os.walk(temp_dir):
+                        for file in files:
+                            abs_path = os.path.join(root, file)
+                            rel_path = os.path.relpath(abs_path, temp_dir)
+                            out_zip.write(abs_path, arcname=rel_path)
 
         size = os.path.getsize(output_zip_path)
         elapsed = time.time() - start_time
