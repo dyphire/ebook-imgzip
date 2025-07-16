@@ -70,18 +70,25 @@ def get_opf_meta_properties(epub_zip):
             props = {}
             for meta in root.findall(".//opf:meta", ns):
                 prop = meta.attrib.get('property', '').strip().lower()
+                name = meta.attrib.get('name', '').strip().lower()
+                content = meta.attrib.get('content', '').strip().lower()
                 value = (meta.text or '').strip().lower()
+
                 if prop:
                     props[prop] = value
+                elif name:
+                    props[name] = content
             return props
     except Exception:
         return {}
 
 def is_manga_epub(epub_zip: zipfile.ZipFile):
     props = get_opf_meta_properties(epub_zip)
-    media_profile = props.get('media:mediaprofile', '')
-    rendition_layout = props.get('rendition:layout', '')
-    return rendition_layout == 'pre-paginated' or media_profile in ['divina', 'pre-paginated']
+    return (
+        props.get('rendition:layout') == 'pre-paginated' or
+        props.get('fixed-layout') == 'true' or
+        props.get('media:mediaprofile') in ['divina', 'pre-paginated']
+    )
 
 def format_size(size_bytes):
     for unit in ['B', 'KB', 'MB', 'GB']:
