@@ -97,11 +97,13 @@ def format_size(size_bytes):
         size_bytes /= 1024
     return f"{size_bytes:.1f} TB"
 
-def unique_filename(base_name, used_names):
+def unique_filename(base_name, used_names, zero_fill=4):
     name = base_name
     count = 1
+    base, ext = os.path.splitext(base_name)
     while name in used_names:
-        name = f"{os.path.splitext(base_name)[0]}_{count}{os.path.splitext(base_name)[1]}"
+        suffix = f"_{str(count).zfill(zero_fill)}"
+        name = f"{base}{suffix}{ext}"
         count += 1
     return name
 
@@ -119,6 +121,7 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
 
             all_files = [f for f in epub_zip.namelist() if not f.endswith('/')]
             total_files = len(all_files)
+            html_files = [f for f in all_files if f.lower().endswith(('.html', '.xhtml'))]
             image_files = [f for f in all_files if f.lower().endswith(IMAGE_EXTENSIONS)]
 
             if total_files == 0 or not image_files:
@@ -130,7 +133,6 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
                 return "skipped", epub_path, 0, 0
 
             img_to_title = {}
-            html_files = [f for f in all_files if f.lower().endswith(('.html', '.xhtml'))]
             for html_file in html_files:
                 try:
                     html_bytes = epub_zip.read(html_file)
@@ -154,6 +156,9 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
                     base_ext = os.path.splitext(image_file)[1].lower()
                     page_title = img_to_title.get(image_file, os.path.splitext(os.path.basename(image_file))[0])
                     safe_title = "".join(c if c.isalnum() or c in " _-()" else "_" for c in page_title) or "untitled"
+
+                    if safe_title.isdigit():
+                        safe_title = safe_title.zfill(4)
 
                     lower_title = safe_title.lower()
                     is_cover = lower_title in ("cover", "封面")
