@@ -14,7 +14,7 @@ import argparse
 import fitz  # PyMuPDF
 import numpy as np
 
-IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.gif')
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.jxl', '.avif')
 
 class EpubImageParser(HTMLParser):
     def __init__(self):
@@ -128,8 +128,8 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
                 return "skipped", epub_path, 0, 0
 
             image_ratio = len(image_files) / total_files
-            if image_ratio < 0.3:
-                print(f"[{os.path.basename(epub_path)}] 图片比例仅 {image_ratio:.1%}，低于 30%，跳过提取")
+            if image_ratio < 0.35:
+                print(f"[{os.path.basename(epub_path)}] 图片比例仅 {image_ratio:.1%}，低于 35%，跳过提取")
                 return "skipped", epub_path, 0, 0
 
             img_to_title = {}
