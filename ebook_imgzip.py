@@ -116,7 +116,8 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
     start_time = time.time()
     try:
         with zipfile.ZipFile(epub_path, 'r') as epub_zip:
-            if skip_manga and is_manga_epub(epub_zip):
+            is_manga = is_manga_epub(epub_zip)
+            if skip_manga and is_manga:
                 return "skipped", epub_path, 0, 0
 
             all_files = [f for f in epub_zip.namelist() if not f.endswith('/')]
@@ -128,7 +129,34 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
                 return "skipped", epub_path, 0, 0
 
             image_ratio = len(image_files) / total_files
-            if image_ratio < 0.35:
+            if not is_manga and image_ratio >= 0.35:
+                # Check if this is text-based vs image-only for high image ratio books
+                # Sample spine pages to check text density
+                has_text_content = False
+                max_samples = min(10, len(html_files))  # Sample up to 10 pages, or all if less
+
+                for html_file in html_files[:max_samples]:
+                    if has_text_content:
+                        break  # Early exit if we already found text
+
+                    try:
+                        html_bytes = epub_zip.read(html_file)
+                        html_content = html_bytes.decode('utf-8', errors='ignore')
+
+                        # Simple text detection: check if there's substantial text content
+                        # Remove HTML tags and check remaining text length
+                        text_content = re.sub(r'<[^>]+>', '', html_content)
+                        text_content = re.sub(r'\s+', ' ', text_content).strip()
+
+                        if len(text_content) > 100:  # Threshold for meaningful text content
+                            has_text_content = True
+                    except Exception:
+                        pass
+
+                if has_text_content:
+                    print(f"[{os.path.basename(epub_path)}] 检测到文本内容，图片比例 {image_ratio:.1%}，跳过提取")
+                    return "skipped", epub_path, 0, 0
+            elif not is_manga and image_ratio < 0.35:
                 print(f"[{os.path.basename(epub_path)}] 图片比例仅 {image_ratio:.1%}，低于 35%，跳过提取")
                 return "skipped", epub_path, 0, 0
 
