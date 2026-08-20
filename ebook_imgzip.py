@@ -129,7 +129,7 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
                 return "skipped", epub_path, 0, 0
 
             image_ratio = len(image_files) / total_files
-            if not is_manga and image_ratio >= 0.35:
+            if not is_manga and image_ratio >= 0.30:
                 # Check if this is text-based vs image-only for high image ratio books
                 # Sample spine pages to check text density
                 has_text_content = False
@@ -156,7 +156,7 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
                 if has_text_content:
                     print(f"[{os.path.basename(epub_path)}] 检测到文本内容，图片比例 {image_ratio:.1%}，跳过提取")
                     return "skipped", epub_path, 0, 0
-            elif not is_manga and image_ratio < 0.35:
+            elif not is_manga and image_ratio < 0.30:
                 print(f"[{os.path.basename(epub_path)}] 图片比例仅 {image_ratio:.1%}，低于 35%，跳过提取")
                 return "skipped", epub_path, 0, 0
 
@@ -251,6 +251,7 @@ def is_blank_page_by_pixmap(page, mean_threshold=250, std_threshold=5):
 
 def extract_images_from_pdf(pdf_path, output_zip_path, delete_source=False):
     start_time = time.time()
+    doc = None
     try:
         doc = fitz.open(pdf_path)
         image_count = 0
@@ -287,6 +288,8 @@ def extract_images_from_pdf(pdf_path, output_zip_path, delete_source=False):
 
         size = os.path.getsize(output_zip_path)
         elapsed = time.time() - start_time
+        doc.close()
+        doc = None
         if delete_source:
             try:
                 os.remove(pdf_path)
@@ -297,6 +300,9 @@ def extract_images_from_pdf(pdf_path, output_zip_path, delete_source=False):
         print(f"[错误] 处理 {pdf_path} 失败：{e}")
         traceback.print_exc()
         return "failed", pdf_path, 0, 0
+    finally:
+        if doc is not None:
+            doc.close()
 
 def batch_extract(epub_root_dir, max_workers=4, skip_manga=True, delete_source=False, output_dir=None):
     if not epub_root_dir or not os.path.isdir(epub_root_dir):
