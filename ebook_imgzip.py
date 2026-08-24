@@ -45,6 +45,40 @@ class EpubImageParser(HTMLParser):
             if self.title is None:
                 self.title = data.strip()
 
+def format_size(size_bytes):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+def unique_filename(base_name, used_names, zero_fill=4):
+    name = base_name
+    count = 1
+    base, ext = os.path.splitext(base_name)
+    while name in used_names:
+        suffix = f"_{str(count).zfill(zero_fill)}"
+        name = f"{base}{suffix}{ext}"
+        count += 1
+    return name
+
+def safe_filename_stem(name):
+    name = str(name or '')
+
+    # Windows 非法文件名字符
+    name = re.sub(r'[\\/:*?"<>|]', '_', name)
+
+    # 控制字符
+    name = re.sub(r'[\x00-\x1f]', '_', name)
+
+    # 合并连续的下划线
+    name = re.sub(r'_+', '_', name)
+
+    # Windows 不允许文件名以空格或 . 结尾
+    name = name.strip(' .')
+
+    return name or 'untitled'
+
 def get_opf_path(epub_zip: zipfile.ZipFile):
     try:
         with epub_zip.open("META-INF/container.xml") as f:
@@ -90,138 +124,364 @@ def is_manga_epub(epub_zip: zipfile.ZipFile):
         props.get('media:mediaprofile') in ['divina', 'pre-paginated']
     )
 
-def format_size(size_bytes):
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f} TB"
+def is_cover_image(image_path, page_title, cover_images):
+    if image_path in cover_images:
+        return True
 
-def unique_filename(base_name, used_names, zero_fill=4):
-    name = base_name
-    count = 1
-    base, ext = os.path.splitext(base_name)
-    while name in used_names:
-        suffix = f"_{str(count).zfill(zero_fill)}"
-        name = f"{base}{suffix}{ext}"
-        count += 1
-    return name
+    stem = os.path.splitext(
+        os.path.basename(image_path)
+    )[0].lower()
 
-def safe_path_component(name):
-    name = re.sub(r'[\\/:*?"<>|]', '_', name)
-    name = name.strip(" .")
-    return name
+    title = (page_title or '').strip().lower()
+
+    cover_names = {
+        'cover',
+        'frontcover',
+        'front_cover',
+        '封面',
+    }
+
+    return stem in cover_names or title in cover_names
+
+def get_epub_cover_images(epub_zip: zipfile.ZipFile):
+    opf_path = get_opf_path(epub_zip)
+    if not opf_path or opf_path not in epub_zip.namelist():
+        return set()
+
+    try:
+        with epub_zip.open(opf_path) as f:
+            tree = ET.parse(f)
+
+        root = tree.getroot()
+        ns = {
+            'opf': 'http://www.idpf.org/2007/opf',
+        }
+
+        opf_dir = os.path.dirname(opf_path)
+
+        manifest = {}
+        cover_images = set()
+
+        for item in root.findall('.//opf:manifest/opf:item', ns):
+            item_id = item.attrib.get('id')
+            href = item.attrib.get('href')
+            properties = item.attrib.get('properties', '')
+
+            if not item_id or not href:
+                continue
+
+            item_path = os.path.normpath(
+                os.path.join(opf_dir, href)
+            ).replace('\\', '/')
+
+            manifest[item_id] = item_path
+
+            # EPUB 3
+            if 'cover-image' in properties.split():
+                cover_images.add(item_path)
+
+        # EPUB 2
+        for meta in root.findall('.//opf:metadata/opf:meta', ns):
+            if meta.attrib.get('name', '').lower() == 'cover':
+                cover_id = meta.attrib.get('content')
+
+                if cover_id and cover_id in manifest:
+                    cover_images.add(manifest[cover_id])
+
+        return cover_images
+
+    except Exception as e:
+        print(f"[警告] 无法解析 EPUB 封面信息: {e}")
+        return set()
+
+def get_spine_image_order(epub_zip: zipfile.ZipFile):
+    opf_path = get_opf_path(epub_zip)
+    if not opf_path or opf_path not in epub_zip.namelist():
+        return []
+
+    try:
+        with epub_zip.open(opf_path) as f:
+            tree = ET.parse(f)
+
+        root = tree.getroot()
+        ns = {
+            'opf': 'http://www.idpf.org/2007/opf',
+        }
+
+        # manifest: id -> href
+        manifest = {}
+
+        for item in root.findall('.//opf:manifest/opf:item', ns):
+            item_id = item.attrib.get('id')
+            href = item.attrib.get('href')
+
+            if item_id and href:
+                item_path = os.path.normpath(
+                    os.path.join(os.path.dirname(opf_path), href)
+                ).replace('\\', '/')
+
+                manifest[item_id] = item_path
+
+        image_order = []
+        seen_images = set()
+
+        # 严格按照 spine 顺序
+        for itemref in root.findall('.//opf:spine/opf:itemref', ns):
+            item_idref = itemref.attrib.get('idref')
+            html_file = manifest.get(item_idref)
+
+            if not html_file or html_file not in epub_zip.namelist():
+                continue
+
+            try:
+                parser = EpubImageParser()
+                parser.feed(
+                    epub_zip.read(html_file).decode(
+                        'utf-8',
+                        errors='ignore'
+                    )
+                )
+
+                page_title = (
+                    parser.title
+                    or os.path.splitext(
+                        os.path.basename(html_file)
+                    )[0]
+                )
+
+                # 按 XHTML 内图片出现顺序
+                for img_src in parser.img_srcs:
+                    img_path = os.path.normpath(
+                        os.path.join(
+                            os.path.dirname(html_file),
+                            img_src
+                        )
+                    ).replace('\\', '/')
+
+                    if (
+                        img_path.lower().endswith(IMAGE_EXTENSIONS)
+                        and img_path in epub_zip.namelist()
+                        and img_path not in seen_images
+                    ):
+                        image_order.append(
+                            (img_path, page_title)
+                        )
+                        seen_images.add(img_path)
+
+            except Exception as e:
+                print(
+                    f"[警告] 无法解析 spine 文件 "
+                    f"{html_file}: {e}"
+                )
+
+        return image_order
+
+    except Exception as e:
+        print(f"[警告] 无法解析 EPUB spine: {e}")
+        return []
+
+def sample_spine_pages(spine_files, count=10):
+    length = len(spine_files)
+
+    if length <= count:
+        return spine_files
+
+    result = []
+    result.extend(spine_files[:3])
+
+    middle_start = max(0, length // 2 - 2)
+    result.extend(spine_files[middle_start:middle_start + 4])
+
+    result.extend(spine_files[-3:])
+
+    return list(dict.fromkeys(result))
+
+
+def get_spine_html_files(epub_zip):
+    opf_path = get_opf_path(epub_zip)
+
+    if not opf_path:
+        return []
+
+    try:
+        with epub_zip.open(opf_path) as f:
+            root = ET.parse(f).getroot()
+
+        ns = {'opf': 'http://www.idpf.org/2007/opf'}
+
+        manifest = {}
+
+        for item in root.findall('.//opf:manifest/opf:item', ns):
+            item_id = item.attrib.get('id')
+            href = item.attrib.get('href')
+
+            if item_id and href:
+                path = os.path.normpath(
+                    os.path.join(os.path.dirname(opf_path), href)
+                ).replace('\\', '/')
+
+                manifest[item_id] = path
+
+        spine_files = []
+
+        for itemref in root.findall('.//opf:spine/opf:itemref', ns):
+            idref = itemref.attrib.get('idref')
+            html_file = manifest.get(idref)
+
+            if html_file and html_file in epub_zip.namelist():
+                spine_files.append(html_file)
+
+        return spine_files
+
+    except Exception as e:
+        print(f"[警告] 获取 spine 失败: {e}")
+        return []
+
+
+def has_epub_text_content(epub_zip, sample_count=10):
+    try:
+        spine_files = get_spine_html_files(epub_zip)
+
+        if not spine_files:
+            return False
+
+        samples = sample_spine_pages(
+            spine_files,
+            sample_count
+        )
+
+        total_length = 0
+        checked = 0
+
+        for html_file in samples:
+            try:
+                content = epub_zip.read(html_file).decode(
+                    'utf-8',
+                    errors='ignore'
+                )
+
+                content = re.sub(
+                    r'<(script|style).*?>.*?</\1>',
+                    '',
+                    content,
+                    flags=re.I | re.S
+                )
+
+                text = re.sub(r'<[^>]+>', '', content)
+                text = re.sub(r'\s+', ' ', text).strip()
+
+                total_length += len(text)
+                checked += 1
+
+            except Exception:
+                continue
+
+        if checked == 0:
+            return False
+
+        average_length = total_length / checked
+
+        print(
+            f"文本检测: 采样 {checked} 页，平均字符 {average_length:.1f}"
+        )
+
+        return average_length > 300
+
+    except Exception as e:
+        print(f"[警告] 文本检测失败: {e}")
+        return False
 
 def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete_source=False):
     start_time = time.time()
+
     try:
         with zipfile.ZipFile(epub_path, 'r') as epub_zip:
             is_manga = is_manga_epub(epub_zip)
+
             if skip_manga and is_manga:
                 return "skipped", epub_path, 0, 0
 
             all_files = [f for f in epub_zip.namelist() if not f.endswith('/')]
-            total_files = len(all_files)
-            html_files = [f for f in all_files if f.lower().endswith(('.html', '.xhtml'))]
-            image_files = [f for f in all_files if f.lower().endswith(IMAGE_EXTENSIONS)]
 
-            if total_files == 0 or not image_files:
+            image_files = [
+                f for f in all_files
+                if f.lower().endswith(IMAGE_EXTENSIONS)
+            ]
+
+            if not image_files:
                 return "skipped", epub_path, 0, 0
 
-            image_ratio = len(image_files) / total_files
-            if not is_manga and image_ratio >= 0.30:
-                # Check if this is text-based vs image-only for high image ratio books
-                # Sample spine pages to check text density
-                has_text_content = False
-                max_samples = min(10, len(html_files))  # Sample up to 10 pages, or all if less
+            image_ratio = len(image_files) / len(all_files)
 
-                for html_file in html_files[:max_samples]:
-                    if has_text_content:
-                        break  # Early exit if we already found text
-
-                    try:
-                        html_bytes = epub_zip.read(html_file)
-                        html_content = html_bytes.decode('utf-8', errors='ignore')
-
-                        # Simple text detection: check if there's substantial text content
-                        # Remove HTML tags and check remaining text length
-                        text_content = re.sub(r'<[^>]+>', '', html_content)
-                        text_content = re.sub(r'\s+', ' ', text_content).strip()
-
-                        if len(text_content) > 100:  # Threshold for meaningful text content
-                            has_text_content = True
-                    except Exception:
-                        pass
-
-                if has_text_content:
-                    print(f"[{os.path.basename(epub_path)}] 检测到文本内容，图片比例 {image_ratio:.1%}，跳过提取")
+            if not is_manga:
+                if image_ratio < 0.30:
+                    print(
+                        f"[{os.path.basename(epub_path)}] 图片比例 {image_ratio:.1%}，跳过"
+                    )
                     return "skipped", epub_path, 0, 0
-            elif not is_manga and image_ratio < 0.30:
-                print(f"[{os.path.basename(epub_path)}] 图片比例仅 {image_ratio:.1%}，低于 35%，跳过提取")
+
+                if has_epub_text_content(epub_zip, sample_count=10):
+                    print(
+                        f"[{os.path.basename(epub_path)}] 检测到文本 EPUB，跳过"
+                    )
+                    return "skipped", epub_path, 0, 0
+
+            image_order = get_spine_image_order(epub_zip)
+
+            if not image_order:
                 return "skipped", epub_path, 0, 0
 
-            img_to_title = {}
-            for html_file in html_files:
-                try:
-                    html_bytes = epub_zip.read(html_file)
-                    parser = EpubImageParser()
-                    parser.feed(html_bytes.decode('utf-8', errors='ignore'))
-                    page_title = parser.title or os.path.splitext(os.path.basename(html_file))[0]
-                    for img_src in parser.img_srcs:
-                        img_path = os.path.normpath(os.path.join(os.path.dirname(html_file), img_src)).replace('\\', '/')
-                        if img_path in image_files:
-                            img_to_title[img_path] = page_title
-                except Exception:
-                    pass
-
-            parent_dirs = set(os.path.basename(os.path.dirname(p)) or 'root' for p in image_files)
-            use_subdir = len(parent_dirs) > 1
+            cover_images = get_epub_cover_images(epub_zip)
 
             with tempfile.TemporaryDirectory() as temp_dir:
                 used_names = set()
-                fallback_index = 1
-                for image_file in image_files:
-                    base_ext = os.path.splitext(image_file)[1].lower()
-                    page_title = img_to_title.get(image_file, os.path.splitext(os.path.basename(image_file))[0])
-                    safe_title = "".join(c if c.isalnum() or c in " _-()" else "_" for c in page_title) or "untitled"
+                page_number = 1
+                cover_written = False
 
-                    if safe_title.isdigit():
-                        safe_title = safe_title.zfill(4)
+                for image_path, page_title in image_order:
+                    ext = os.path.splitext(image_path)[1].lower()
 
-                    lower_title = safe_title.lower()
-                    is_cover = lower_title in ("cover", "封面")
-                    match = re.search(r'\d+', safe_title)
-                    if is_cover:
-                        number_prefix = "0000"
-                    elif match:
-                        number_prefix = match.group(0).zfill(4)
+                    is_cover = (
+                        image_path in cover_images
+                        or is_cover_image(
+                            image_path,
+                            page_title,
+                            cover_images
+                        )
+                    )
+
+                    if is_cover and not cover_written:
+                        number = 0
+                        cover_written = True
                     else:
-                        number_prefix = str(9000 + fallback_index).zfill(4)
-                        fallback_index += 1
+                        number = page_number
+                        page_number += 1
 
-                    base_name = f"{number_prefix}_{safe_title}{base_ext}"
-                    name = unique_filename(base_name, used_names)
-                    used_names.add(name)
+                    safe_title = safe_filename_stem(page_title)
+                    original_name = safe_filename_stem(
+                        os.path.splitext(os.path.basename(image_path))[0]
+                    )
 
-                    parent_base = os.path.basename(os.path.dirname(image_file))
-                    parent_dir_name = safe_path_component(parent_base) if parent_base else None
+                    filename = f"{number:04d}_{safe_title}_{original_name}{ext}"
+                    filename = unique_filename(filename, used_names)
+                    used_names.add(filename)
 
-                    if is_cover or not use_subdir or not parent_dir_name:
-                        target_subdir = temp_dir
-                    else:
-                        target_subdir = os.path.join(temp_dir, parent_dir_name)
-                    os.makedirs(target_subdir, exist_ok=True)
+                    target_path = os.path.join(temp_dir, filename)
 
-                    target_path = os.path.join(target_subdir, name)
-                    with epub_zip.open(image_file) as source, open(target_path, 'wb') as target:
+                    with epub_zip.open(image_path) as source, open(target_path, 'wb') as target:
                         shutil.copyfileobj(source, target)
 
+                output_files = sorted(os.listdir(temp_dir))
+
+                if not output_files:
+                    return "skipped", epub_path, 0, 0
+
                 with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as out_zip:
-                    for root, _, files in os.walk(temp_dir):
-                        for file in files:
-                            abs_path = os.path.join(root, file)
-                            rel_path = os.path.relpath(abs_path, temp_dir)
-                            out_zip.write(abs_path, arcname=rel_path)
+                    for filename in output_files:
+                        out_zip.write(
+                            os.path.join(temp_dir, filename),
+                            arcname=filename
+                        )
 
         size = os.path.getsize(output_zip_path)
         elapsed = time.time() - start_time
