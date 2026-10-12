@@ -21,7 +21,8 @@
 ## 📦 环境要求
 
 - Python 3.7+
-- 安装依赖：`pip install PyMuPDF`
+- 安装依赖：`pip install PyMuPDF Pillow numpy`
+- 可选依赖：`pip install tqdm`（显示 PDF 转换进度条，不装则静默执行）
 
 ---
 
@@ -42,6 +43,8 @@ python ebook_imgzip.py -d 输入目录 [可选参数]
 | `--no-skip-manga`  | 不跳过漫画类 EPUB（默认跳过）              |
 | `--delete-source`  | 提取成功后删除原始 EPUB/PDF 文件          |
 | `-w, --workers`    | 最大并发线程数（默认自动设定）                |
+| `--dpi`            | PDF 渲染分辨率 DPI（默认: 300）           |
+| `--quality`        | PDF 渲染 JPEG 质量 1-100（默认: 85）      |
 
 ---
 
@@ -74,6 +77,8 @@ python epub_imgzip.py
 
 - 封面命名为 `0000_封面.jpg`
 - 若无法提取标题，则使用文件名或序号生成占位标题
+
+PDF 文件则按页渲染为 JPEG 图片（文件名按页码补零命名，如 `001.jpg`）
 
 ---
 

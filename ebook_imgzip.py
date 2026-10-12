@@ -11,10 +11,20 @@ import traceback
 import multiprocessing
 from html.parser import HTMLParser
 import argparse
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF
 import numpy as np
+from PIL import Image
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.jxl', '.avif')
+
+DEFAULT_DPI = 300
+DEFAULT_QUALITY = 85
 
 class EpubImageParser(HTMLParser):
     def __init__(self):
@@ -498,58 +508,102 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
         traceback.print_exc()
         return "failed", epub_path, 0, 0
 
-def is_blank_page_by_pixmap(page, mean_threshold=250, std_threshold=5):
-    try:
-        pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), colorspace=fitz.csGRAY)
-        img_data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-        mean = np.mean(img_data)
-        std = np.std(img_data)
-        return mean > mean_threshold and std < std_threshold
-    except Exception as e:
-        print(f"[警告] 渲染页失败: {e}")
-        return False
+def render_pdf_page_as_jpeg(pdf_path, page_index, output_file, dpi, quality):
+    """将 PDF 单页按指定 DPI 渲染并保存为 JPEG（参考 pdf2cbz.py）
 
-def extract_images_from_pdf(pdf_path, output_zip_path, delete_source=False):
+    整个流程（含空白页检测）在独立进程中执行。
+    注意：PyMuPDF 渲染与 Pillow optimize 编码均受 GIL 限制，线程无法并行，
+    必须使用进程池才能利用多核（与 pdf2cbz.py 的 ProcessPoolExecutor 一致）。
+    """
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc.load_page(page_index)
+
+        # 空白页检测（低分辨率灰度渲染）
+        blank_pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), colorspace=fitz.csGRAY)
+        img_data = np.frombuffer(blank_pix.samples, dtype=np.uint8).reshape(blank_pix.height, blank_pix.width)
+        if np.mean(img_data) > 250 and np.std(img_data) < 5:
+            return None
+
+        zoom = dpi / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        img.save(output_file, "JPEG", quality=quality, optimize=True, progressive=True)
+        return output_file
+    finally:
+        doc.close()
+
+def extract_images_from_pdf(pdf_path, output_zip_path, dpi=DEFAULT_DPI, quality=DEFAULT_QUALITY, delete_source=False, render_workers=None):
     start_time = time.time()
     doc = None
     try:
         doc = fitz.open(pdf_path)
-        image_count = 0
+        num_pages = len(doc)
+        padding_width = len(str(num_pages))
+        doc.close()
+        doc = None
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            used_names = set()
-            for page_index in range(len(doc)):
-                page = doc[page_index]
+            jobs = []
+            for page_index in range(num_pages):
+                output_file = os.path.join(
+                    temp_dir,
+                    f"page_{str(page_index + 1).zfill(padding_width)}.jpg"
+                )
+                jobs.append((str(pdf_path), page_index, output_file, dpi, quality))
 
-                if is_blank_page_by_pixmap(page):
-                    continue
-
-                images = page.get_images(full=True)
-                for img_index, img in enumerate(images):
-                    xref = img[0]
-                    base = f"{str(page_index + 1).zfill(4)}_{str(img_index + 1).zfill(2)}.jpg"
-                    name = unique_filename(base, used_names)
-                    used_names.add(name)
-                    pix = fitz.Pixmap(doc, xref)
-                    if pix.n > 4:
-                        pix = fitz.Pixmap(fitz.csRGB, pix)
-                    if pix.width < 100 or pix.height < 100:
-                        continue
-                    pix.save(os.path.join(temp_dir, name))
-                    pix = None
-                    image_count += 1
-
-            if image_count == 0:
+            if not jobs:
                 return "skipped", pdf_path, 0, 0
 
-            with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as out_zip:
-                for file_name in os.listdir(temp_dir):
-                    out_zip.write(os.path.join(temp_dir, file_name), arcname=file_name)
+            # 参考 pdf2cbz.py：进程池并行渲染各页（渲染与 optimize 编码均受 GIL 限制，必须用进程而非线程）
+            if render_workers is None:
+                render_workers = (multiprocessing.cpu_count() or 1)
+            max_render_workers = max(1, min(len(jobs), render_workers))
+            from concurrent.futures import ProcessPoolExecutor
+
+            pdf_name = os.path.basename(pdf_path)
+            pbar = tqdm(total=num_pages, desc=f"渲染 {pdf_name}", unit="页", leave=False) if HAS_TQDM else None
+            try:
+                with ProcessPoolExecutor(max_workers=max_render_workers) as render_executor:
+                    futures = {
+                        render_executor.submit(render_pdf_page_as_jpeg, *job): job[1]
+                        for job in jobs
+                    }
+
+                    rendered_files = []
+                    for future in as_completed(futures):
+                        page_index = futures[future]
+                        try:
+                            output_file = future.result()
+                            if output_file is not None:
+                                rendered_files.append(output_file)
+                        except Exception as e:
+                            print(f"[警告] 渲染第 {page_index + 1} 页失败: {e}")
+                        if pbar is not None:
+                            pbar.update(1)
+            finally:
+                if pbar is not None:
+                    pbar.close()
+
+            if not rendered_files:
+                return "skipped", pdf_path, 0, 0
+
+            # 按页码顺序打包，文件名使用补零序号
+            rendered_files.sort(key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split('_')[1]))
+            pbar = tqdm(total=len(rendered_files), desc=f"打包 {pdf_name}", unit="页", leave=False) if HAS_TQDM else None
+            try:
+                with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as out_zip:
+                    for page_num, file_path in enumerate(rendered_files, start=1):
+                        arcname = f"{page_num:0{padding_width}d}.jpg"
+                        out_zip.write(file_path, arcname=arcname)
+                        if pbar is not None:
+                            pbar.update(1)
+            finally:
+                if pbar is not None:
+                    pbar.close()
 
         size = os.path.getsize(output_zip_path)
         elapsed = time.time() - start_time
-        doc.close()
-        doc = None
         if delete_source:
             try:
                 os.remove(pdf_path)
@@ -564,7 +618,7 @@ def extract_images_from_pdf(pdf_path, output_zip_path, delete_source=False):
         if doc is not None:
             doc.close()
 
-def batch_extract(epub_root_dir, max_workers=4, skip_manga=True, delete_source=False, output_dir=None):
+def batch_extract(epub_root_dir, max_workers=4, skip_manga=True, delete_source=False, output_dir=None, dpi=DEFAULT_DPI, quality=DEFAULT_QUALITY):
     if not epub_root_dir or not os.path.isdir(epub_root_dir):
         print("无效的目录路径！")
         return
@@ -579,6 +633,9 @@ def batch_extract(epub_root_dir, max_workers=4, skip_manga=True, delete_source=F
     if total == 0:
         print("目录及其子目录中没有找到 epub/pdf 文件")
         return
+
+    # 批量模式下多个文件并发处理，每个 PDF 内部的渲染进程数需相应减少，避免进程超订
+    pdf_render_workers = max(1, (multiprocessing.cpu_count() or 1) // max_workers)
 
     success = 0
     skipped = 0
@@ -605,7 +662,7 @@ def batch_extract(epub_root_dir, max_workers=4, skip_manga=True, delete_source=F
         if ext == '.epub':
             return extract_images_from_epub(path, output_path, skip_manga=skip_manga, delete_source=delete_source)
         elif ext == '.pdf':
-            return extract_images_from_pdf(path, output_path, delete_source=delete_source)
+            return extract_images_from_pdf(path, output_path, dpi=dpi, quality=quality, delete_source=delete_source, render_workers=pdf_render_workers)
         else:
             return "skipped", path, 0, 0
 
@@ -642,6 +699,8 @@ if __name__ == '__main__':
     parser.add_argument('--no-skip-manga', action='store_true', help="不跳过漫画类 EPUB（即 pre-paginated）")
     parser.add_argument('--delete-source', action='store_true', help="成功提取后删除源文件")
     parser.add_argument('-w', '--workers', type=int, default=None, help="最大并发线程数（默认自动计算）")
+    parser.add_argument('--dpi', type=int, default=DEFAULT_DPI, help=f"PDF 渲染分辨率 DPI（默认: {DEFAULT_DPI}）")
+    parser.add_argument('--quality', type=int, default=DEFAULT_QUALITY, help=f"PDF 渲染 JPEG 质量 1-100（默认: {DEFAULT_QUALITY}）")
 
     args = parser.parse_args()
     input_dir = args.dir
@@ -649,6 +708,12 @@ if __name__ == '__main__':
     delete_source = args.delete_source
     max_workers = args.workers or min(32, (multiprocessing.cpu_count() or 1) + 4)
     output_dir = args.output_dir.strip()
+    dpi = args.dpi
+    quality = args.quality
+
+    if quality < 1 or quality > 100:
+        print("JPEG 质量必须在 1-100 之间！")
+        exit(1)
 
     if not input_dir:
         input_dir = input("请输入包含 EPUB/PDF 文件的目录路径：").strip().strip('"').replace('\\', '/')
@@ -681,5 +746,7 @@ if __name__ == '__main__':
             max_workers=max_workers,
             skip_manga=skip_manga,
             delete_source=delete_source,
-            output_dir=output_dir if output_dir else None
+            output_dir=output_dir if output_dir else None,
+            dpi=dpi,
+            quality=quality
         )
