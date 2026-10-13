@@ -24,7 +24,7 @@ except ImportError:
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.jxl', '.avif')
 
-DEFAULT_DPI = 300
+DEFAULT_DPI = 200
 DEFAULT_QUALITY = 85
 
 class EpubImageParser(HTMLParser):
@@ -488,28 +488,95 @@ def extract_images_from_epub(epub_path, output_zip_path, skip_manga=True, delete
         traceback.print_exc()
         return "failed", epub_path, 0, 0
 
-def render_pdf_page_as_jpeg(pdf_path, page_index, output_file, dpi, quality):
-    """将 PDF 单页按指定 DPI 渲染并保存为 JPEG（参考 pdf2cbz.py）
+def _is_blank_page(page):
+    """空白页检测（低分辨率灰度渲染）"""
+    blank_pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), colorspace=fitz.csGRAY)
+    img_data = np.frombuffer(blank_pix.samples, dtype=np.uint8).reshape(blank_pix.height, blank_pix.width)
+    return np.mean(img_data) > 250 and np.std(img_data) < 5
 
-    整个流程（含空白页检测）在独立进程中执行。
-    注意：PyMuPDF 渲染与 Pillow optimize 编码均受 GIL 限制，线程无法并行，
-    必须使用进程池才能利用多核（与 pdf2cbz.py 的 ProcessPoolExecutor 一致）。
+def _render_page_to_jpeg(page, output_file, dpi, quality):
+    zoom = dpi / 72.0
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    img.save(output_file, "JPEG", quality=quality, optimize=True, progressive=True)
+
+def extract_pdf_page_images(pdf_path, page_index, output_dir, padding_width, dpi, quality):
+    """提取单页内嵌图像（进程池 worker）
+
+    优先原样提取（无损、快）：JPEG 直接取出原始字节流，其余格式解码后保存为 JPEG。
+    以下情况回退为该页整页渲染：带蒙版（SMask）、色彩空间缺失、ImageMask、
+    带 alpha 通道、JPEG 保存失败。
+    返回该页生成的文件列表（空白页 / 无可用图像的页面返回空列表）。
     """
     doc = fitz.open(pdf_path)
     try:
         page = doc.load_page(page_index)
 
-        # 空白页检测（低分辨率灰度渲染）
-        blank_pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), colorspace=fitz.csGRAY)
-        img_data = np.frombuffer(blank_pix.samples, dtype=np.uint8).reshape(blank_pix.height, blank_pix.width)
-        if np.mean(img_data) > 250 and np.std(img_data) < 5:
-            return None
+        if _is_blank_page(page):
+            return []
 
-        zoom = dpi / 72.0
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        img.save(output_file, "JPEG", quality=quality, optimize=True, progressive=True)
-        return output_file
+        page_num = str(page_index + 1).zfill(padding_width)
+        output_files = []
+
+        for img_index, img in enumerate(page.get_images(full=True), start=1):
+            xref, smask = img[0], img[1]
+            img_width, img_height = img[2], img[3]
+            colorspace = img[5] if len(img) > 5 else None
+            filter_name = img[8] if len(img) > 8 else ''
+
+            if img_width < 100 or img_height < 100:
+                continue
+
+            # 蒙版图像直接提取结果残缺；色彩空间缺失时无法正常解码，均整页渲染兜底
+            if smask != 0 or not colorspace:
+                output_file = os.path.join(output_dir, f"page_{page_num}.jpg")
+                _render_page_to_jpeg(page, output_file, dpi, quality)
+                return [output_file]
+
+            # 模板蒙版（ImageMask，常为 1-bit 线条/文字镂刻）必须结合页面绘制上下文，整页渲染兜底
+            try:
+                if doc.xref_get_key(xref, 'ImageMask')[1] == 'true':
+                    output_file = os.path.join(output_dir, f"page_{page_num}.jpg")
+                    _render_page_to_jpeg(page, output_file, dpi, quality)
+                    return [output_file]
+            except Exception:
+                pass
+
+            # JPEG（DCTDecode）直接取出原始字节流，无损且免解码重编码
+            if filter_name == 'DCTDecode':
+                output_file = os.path.join(output_dir, f"page_{page_num}_img_{img_index:02d}.jpg")
+                with open(output_file, 'wb') as f:
+                    f.write(doc.xref_stream_raw(xref))
+                output_files.append(output_file)
+                continue
+
+            pix = None
+            try:
+                pix = fitz.Pixmap(doc, xref)
+                if pix.n > 4:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                if pix.width < 100 or pix.height < 100:
+                    continue
+                if pix.alpha:
+                    # 带 alpha 通道：直接提取无法保证与页面背景的正确合成，整页渲染兜底
+                    pix = None
+                    output_file = os.path.join(output_dir, f"page_{page_num}.jpg")
+                    _render_page_to_jpeg(page, output_file, dpi, quality)
+                    return [output_file]
+                output_file = os.path.join(output_dir, f"page_{page_num}_img_{img_index:02d}.jpg")
+                try:
+                    pix.save(output_file, output="jpeg", jpg_quality=quality)
+                except Exception:
+                    # JPEG 保存失败（如异常的色彩空间），整页渲染兜底
+                    pix = None
+                    output_file = os.path.join(output_dir, f"page_{page_num}.jpg")
+                    _render_page_to_jpeg(page, output_file, dpi, quality)
+                    return [output_file]
+                output_files.append(output_file)
+            finally:
+                pix = None
+
+        return output_files
     finally:
         doc.close()
 
@@ -520,33 +587,40 @@ def extract_images_from_pdf(pdf_path, output_zip_path, dpi=DEFAULT_DPI, quality=
         doc = fitz.open(pdf_path)
         num_pages = len(doc)
         padding_width = len(str(num_pages))
+
+        # 文本型 PDF 检测（只读页面元数据，不渲染）：
+        # 图像页占比低于 30% 视为文本型 PDF，整本跳过
+        pages_with_images = 0
+        for i in range(num_pages):
+            if doc[i].get_images(full=True):
+                pages_with_images += 1
+        image_ratio = pages_with_images / num_pages if num_pages else 0
+        if image_ratio < 0.30:
+            print(f"[{os.path.basename(pdf_path)}] 非图像型 PDF（图像页占比 {image_ratio:.1%}），跳过")
+            return "skipped", pdf_path, 0, 0
         doc.close()
         doc = None
 
         with tempfile.TemporaryDirectory() as temp_dir:
             jobs = []
             for page_index in range(num_pages):
-                output_file = os.path.join(
-                    temp_dir,
-                    f"page_{str(page_index + 1).zfill(padding_width)}.jpg"
-                )
-                jobs.append((str(pdf_path), page_index, output_file, dpi, quality))
+                jobs.append((str(pdf_path), page_index, temp_dir, padding_width, dpi, quality))
 
             if not jobs:
                 return "skipped", pdf_path, 0, 0
 
-            # 参考 pdf2cbz.py：进程池并行渲染各页（渲染与 optimize 编码均受 GIL 限制，必须用进程而非线程）
+            # 参考 pdf2cbz.py：进程池并行处理各页（渲染与 optimize 编码均受 GIL 限制，必须用进程而非线程）
             if render_workers is None:
                 render_workers = (multiprocessing.cpu_count() or 1)
             max_render_workers = max(1, min(len(jobs), render_workers))
             from concurrent.futures import ProcessPoolExecutor
 
             pdf_name = os.path.basename(pdf_path)
-            pbar = tqdm(total=num_pages, desc=f"渲染 {pdf_name}", unit="页", leave=False) if HAS_TQDM else None
+            pbar = tqdm(total=num_pages, desc=f"处理 {pdf_name}", unit="页", leave=False) if HAS_TQDM else None
             try:
                 with ProcessPoolExecutor(max_workers=max_render_workers) as render_executor:
                     futures = {
-                        render_executor.submit(render_pdf_page_as_jpeg, *job): job[1]
+                        render_executor.submit(extract_pdf_page_images, *job): job[1]
                         for job in jobs
                     }
 
@@ -554,11 +628,9 @@ def extract_images_from_pdf(pdf_path, output_zip_path, dpi=DEFAULT_DPI, quality=
                     for future in as_completed(futures):
                         page_index = futures[future]
                         try:
-                            output_file = future.result()
-                            if output_file is not None:
-                                rendered_files.append(output_file)
+                            rendered_files.extend(future.result())
                         except Exception as e:
-                            print(f"[警告] 渲染第 {page_index + 1} 页失败: {e}")
+                            print(f"[警告] 处理第 {page_index + 1} 页失败: {e}")
                         if pbar is not None:
                             pbar.update(1)
             finally:
@@ -568,14 +640,15 @@ def extract_images_from_pdf(pdf_path, output_zip_path, dpi=DEFAULT_DPI, quality=
             if not rendered_files:
                 return "skipped", pdf_path, 0, 0
 
-            # 按页码顺序打包，文件名使用补零序号
-            rendered_files.sort(key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split('_')[1]))
+            # 文件名已补零，字典序即页序
+            rendered_files.sort()
             pbar = tqdm(total=len(rendered_files), desc=f"打包 {pdf_name}", unit="页", leave=False) if HAS_TQDM else None
             try:
-                # JPEG 已是压缩格式，直接存储（ZIP_STORED），避免 DEFLATE 的无效 CPU 开销
+                # JPEG/PNG 已是压缩格式，直接存储（ZIP_STORED），避免 DEFLATE 的无效 CPU 开销
                 with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_STORED) as out_zip:
                     for page_num, file_path in enumerate(rendered_files, start=1):
-                        arcname = f"{page_num:0{padding_width}d}.jpg"
+                        ext = os.path.splitext(file_path)[1].lower()
+                        arcname = f"{page_num:0{padding_width}d}{ext}"
                         out_zip.write(file_path, arcname=arcname)
                         if pbar is not None:
                             pbar.update(1)
