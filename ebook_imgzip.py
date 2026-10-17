@@ -630,7 +630,10 @@ def extract_images_from_pdf(pdf_path, output_zip_path, dpi=DEFAULT_DPI, quality=
                         try:
                             rendered_files.extend(future.result())
                         except Exception as e:
-                            print(f"[警告] 处理第 {page_index + 1} 页失败: {e}")
+                            # 任一页面渲染/提取失败即整本跳过，取消剩余任务并中止本书转换
+                            for pending in futures:
+                                pending.cancel()
+                            raise RuntimeError(f"第 {page_index + 1} 页处理失败: {e}") from e
                         if pbar is not None:
                             pbar.update(1)
             finally:
